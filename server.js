@@ -11,11 +11,11 @@ const MASTER_CHAT_ID = process.env.MASTER_CHAT_ID;
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Збереження розкладу
+// Збереження розкладу: { "YYYY-MM-DD": ["10:00", "11:00", ...] }
 let schedule = {};
 
-// Стан користувача для очікування тексту
-let userStates = {};
+// Тимчасова пам'ять для збереження вибору Колі під час кліків по кнопках
+let masterFlow = {};
 
 // API для сайту
 app.get('/api/schedule', (req, res) => {
@@ -47,36 +47,53 @@ app.post('/api/book', (req, res) => {
   }
 });
 
-// Керування ботом
+// --- TELEGRAM БОТ ---
+
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
-
   if (MASTER_CHAT_ID && chatId.toString() !== MASTER_CHAT_ID.toString()) {
-    return bot.sendMessage(chatId, "⛔ У вас немає доступу до керування OSTRI.");
+    return bot.sendMessage(chatId, "⛔ У вас немає доступу.");
   }
-
   showMainMenu(chatId);
 });
 
 function showMainMenu(chatId) {
-  bot.sendMessage(chatId, "👋 **Панель керування розкладом OSTRI**\n\nОберіть дію:", {
+  bot.sendMessage(chatId, "✂️ **Керування розкладом OSTRI**\n\nОберіть дію:", {
     parse_mode: 'Markdown',
     reply_markup: {
       inline_keyboard: [
         [{ text: "📅 Переглянути розклад", callback_data: "view_schedule" }],
-        [{ text: "➕ Додати час", callback_data: "add_time_prompt" }],
-        [{ text: "❌ Очистити весь розклад", callback_data: "clear_schedule" }]
+        [{ text: "➕ Додати робочий день / години", callback_data: "step_select_date" }],
+        [{ text: "🗑️ Очистити весь розклад", callback_data: "clear_schedule" }]
       ]
     }
   });
 }
 
+// Допоміжна функція для отримання дат (Сьогодні, Завтра, післязавтра)
+function getQuickDates() {
+  const dates = [];
+  for (let i = 0; i < 4; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() + i);
+    const dateString = d.toISOString().split('T')[0];
+    
+    let label = dateString;
+    if (i === 0) label = `Сьогодні (${dateString})`;
+    else if (i === 1) label = `Завтра (${dateString})`;
+    
+    dates.push({ text: label, date: dateString });
+  }
+  return dates;
+}
+
 bot.on('callback_query', (query) => {
   const chatId = query.message.chat.id;
   const data = query.data;
+  const messageId = query.message.message_id;
 
   if (data === "view_schedule") {
-    let msg = "📅 **Поточний відкритий розклад:**\n\n";
+    let msg = "📅 **Поточний розклад:**\n\n";
     if (Object.keys(schedule).length === 0) {
       msg += "❌ Немає відкритих дат.";
     } else {
@@ -85,56 +102,92 @@ bot.on('callback_query', (query) => {
       }
     }
     bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-  }
-
-  if (data === "add_time_prompt") {
-    userStates[chatId] = 'awaiting_add';
-    const today = new Date().toISOString().split('T')[0];
-    bot.sendMessage(
-      chatId,
-      `Надішліть дату і години у форматі:\n\`${today} 10:00, 11:00, 14:00, 16:00\`\n\n(або декілька годин через кому):`,
-      { parse_mode: 'Markdown' }
-    );
+    return;
   }
 
   if (data === "clear_schedule") {
     schedule = {};
-    bot.sendMessage(chatId, "🗑️ Всі дати й години успішно видалено!");
+    bot.sendMessage(chatId, "🗑️ Весь розклад успішно очищено!");
+    showMainMenu(chatId);
+    return;
   }
-});
 
-// Обробка звичайного тексту від Колі
-bot.on('message', (msg) => {
-  const chatId = msg.chat.id;
-  const text = msg.text ? msg.text.trim() : '';
+  // Крок 1: Вибір дати кнопками
+  if (data === "step_select_date") {
+    const quickDates = getQuickDates();
+    const keyboard = quickDates.map(item => [{ text: item.text, callback_data: `date_${item.date}` }]);
+    keyboard.push([{ text: "« Головне меню", callback_data: "main_menu" }]);
 
-  if (text.startsWith('/')) return;
-
-  if (userStates[chatId] === 'awaiting_add' || text.match(/^\d{4}-\d{2}-\d{2}/)) {
-    // Приклад тексту: "2026-10-21 10:00, 11:00, 14:00"
-    const parts = text.split(' ');
-    const date = parts[0];
-    const timesRaw = parts.slice(1).join(' ');
-
-    if (!date.match(/^\d{4}-\d{2}-\d{2}$/)) {
-      return bot.sendMessage(chatId, "⚠️ Невірний формат дати. Вкажіть у форматі YYYY-MM-DD (наприклад, 2026-10-21).");
-    }
-
-    const times = timesRaw.split(',').map(t => t.trim()).filter(t => t.length > 0);
-
-    if (times.length === 0) {
-      return bot.sendMessage(chatId, "⚠️ Вкажіть хоча б одну годину! Наприклад:\n`2026-10-21 11:00, 12:00, 15:00`", { parse_mode: 'Markdown' });
-    }
-
-    if (!schedule[date]) schedule[date] = [];
-    times.forEach(t => {
-      if (!schedule[date].includes(t)) schedule[date].push(t);
+    bot.editMessageText("📅 **Оберіть день для роботи:**", {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: keyboard }
     });
-    schedule[date].sort();
+    return;
+  }
 
-    delete userStates[chatId];
+  // Повернення в головне меню
+  if (data === "main_menu") {
+    bot.deleteMessage(chatId, messageId).catch(() => {});
+    showMainMenu(chatId);
+    return;
+  }
 
-    bot.sendMessage(chatId, `✅ **Успішно додано!**\n\n📅 **${date}**: ${schedule[date].join(', ')}`, { parse_mode: 'Markdown' });
+  // Крок 2: Дата обрана, пропонуємо готові набори годин або повний день
+  if (data.startsWith("date_")) {
+    const selectedDate = data.replace("date_", "");
+    masterFlow[chatId] = { date: selectedDate };
+
+    bot.editMessageText(`📅 Обрана дата: **${selectedDate}**\n\nОберіть готові години або стандартний повний день:`, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "⚡ Повний день (09:00 - 19:00)", callback_data: "set_full_day" }],
+          [{ text: "🌅 Тільки перша половина (09:00 - 14:00)", callback_data: "set_morning" }],
+          [{ text: "🌇 Тільки друга половина (14:00 - 19:00)", callback_data: "set_evening" }],
+          [{ text: "« Назад до вибору дат", callback_data: "step_select_date" }]
+        ]
+      }
+    });
+    return;
+  }
+
+  // Швидке додавання повного дня (з інтервалом в 1 годину)
+  if (data === "set_full_day" || data === "set_morning" || data === "set_evening") {
+    const selectedDate = masterFlow[chatId] ? masterFlow[chatId].date : null;
+    if (!selectedDate) {
+      bot.sendMessage(chatId, "⚠️ Сталася помилка. Почніть спочатку з /start");
+      return;
+    }
+
+    let times = [];
+    if (data === "set_full_day") {
+      times = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00"];
+    } else if (data === "set_morning") {
+      times = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00"];
+    } else if (data === "set_evening") {
+      times = ["14:00", "15:00", "16:00", "17:00", "18:00", "19:00"];
+    }
+
+    if (!schedule[selectedDate]) schedule[selectedDate] = [];
+    times.forEach(t => {
+      if (!schedule[selectedDate].includes(t)) schedule[selectedDate].push(t);
+    });
+    schedule[selectedDate].sort();
+
+    delete masterFlow[chatId];
+
+    bot.editMessageText(`✅ **Успішно додано!**\n\n📅 **${selectedDate}**\n⏰ Години: ${times.join(', ')}`, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: 'Markdown'
+    });
+
+    setTimeout(() => showMainMenu(chatId), 2000);
+    return;
   }
 });
 
