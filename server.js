@@ -14,6 +14,11 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 let schedule = {};
 let masterSetup = {};
 
+// Налаштовуємо постійне меню команд у Telegram (кнопка Menu біля скріпки)
+bot.setMyCommands([
+  { command: '/start', description: 'Відкрити головне меню' }
+]);
+
 app.get('/api/schedule', (req, res) => {
   res.json(schedule);
 });
@@ -45,13 +50,30 @@ app.post('/api/book', (req, res) => {
 
 // --- TELEGRAM БОТ ---
 
-bot.onText(/\/start/, (msg) => {
+// Обробка /start або кліку по постійній кнопці
+bot.onText(/\/start|🚀 ГОЛОВНЕ МЕНЮ/, (msg) => {
   const chatId = msg.chat.id;
   if (MASTER_CHAT_ID && chatId.toString() !== MASTER_CHAT_ID.toString()) {
     return bot.sendMessage(chatId, "⛔ У вас немає доступу.");
   }
-  showMainMenu(chatId, msg.message_id);
+
+  // Надсилаємо постійну клавіатуру внизу екрана
+  sendPersistentKeyboard(chatId);
+  showMainMenu(chatId);
 });
+
+// Функція для встановлення постійної кнопки під полем вводу
+function sendPersistentKeyboard(chatId) {
+  bot.sendMessage(chatId, "Панель керування готова 👇", {
+    reply_markup: {
+      keyboard: [
+        [{ text: "🚀 ГОЛОВНЕ МЕНЮ" }]
+      ],
+      resize_keyboard: true, // робить кнопку компактною
+      persistent: true       // кнопка завжди висить внизу
+    }
+  });
+}
 
 function showMainMenu(chatId, messageId = null) {
   const text = "✂️ <b>ПАНЕЛЬ КЕРУВАННЯ OSTRI</b>\n\nОберіть потрібну дію нижче:";
@@ -120,7 +142,7 @@ bot.on('callback_query', (query) => {
       message_id: messageId,
       parse_mode: 'HTML',
       reply_markup: {
-        inline_keyboard: [[{ text: "« Головне меню", callback_data: "main_menu" }]]
+        inline_keyboard: [[{ text: "« Повернутися в меню", callback_data: "main_menu" }]]
       }
     }).catch(() => {});
     return;
@@ -133,7 +155,7 @@ bot.on('callback_query', (query) => {
       message_id: messageId,
       parse_mode: 'HTML',
       reply_markup: {
-        inline_keyboard: [[{ text: "« Головне меню", callback_data: "main_menu" }]]
+        inline_keyboard: [[{ text: "« Повернутися в меню", callback_data: "main_menu" }]]
       }
     }).catch(() => {});
     return;
@@ -142,7 +164,7 @@ bot.on('callback_query', (query) => {
   if (data === "step_7_days") {
     const days = getNext7Days();
     const keyboard = days.map(item => [{ text: item.text, callback_data: `pickday_${item.date}` }]);
-    keyboard.push([{ text: "« Головне меню", callback_data: "main_menu" }]);
+    keyboard.push([{ text: "« Повернутися в меню", callback_data: "main_menu" }]);
 
     bot.editMessageText("📅 <b>Оберіть день для налаштування:</b>", {
       chat_id: chatId,
@@ -199,7 +221,7 @@ bot.on('callback_query', (query) => {
       message_id: messageId,
       parse_mode: 'HTML',
       reply_markup: {
-        inline_keyboard: [[{ text: "« Головне меню", callback_data: "main_menu" }]]
+        inline_keyboard: [[{ text: "« Повернутися в меню", callback_data: "main_menu" }]]
       }
     }).catch(() => {});
     return;
@@ -251,6 +273,13 @@ function renderTimeGrid(chatId, messageId) {
     }
   ).catch(() => {});
 }
+
+// Реєстрація текстових повідомлень (на випадок кліку по клавіатурі)
+bot.on('message', (msg) => {
+  if (msg.text === "🚀 ГОЛОВНЕ МЕНЮ") {
+    showMainMenu(msg.chat.id);
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
