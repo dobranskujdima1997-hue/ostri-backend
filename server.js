@@ -14,7 +14,6 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 let schedule = {};
 let masterSetup = {};
 
-// Налаштовуємо постійне меню команд у Telegram (кнопка Menu біля скріпки)
 bot.setMyCommands([
   { command: '/start', description: 'Відкрити головне меню' }
 ]);
@@ -50,30 +49,13 @@ app.post('/api/book', (req, res) => {
 
 // --- TELEGRAM БОТ ---
 
-// Обробка /start або кліку по постійній кнопці
 bot.onText(/\/start|🚀 ГОЛОВНЕ МЕНЮ/, (msg) => {
   const chatId = msg.chat.id;
   if (MASTER_CHAT_ID && chatId.toString() !== MASTER_CHAT_ID.toString()) {
     return bot.sendMessage(chatId, "⛔ У вас немає доступу.");
   }
-
-  // Надсилаємо постійну клавіатуру внизу екрана
-  sendPersistentKeyboard(chatId);
   showMainMenu(chatId);
 });
-
-// Функція для встановлення постійної кнопки під полем вводу
-function sendPersistentKeyboard(chatId) {
-  bot.sendMessage(chatId, "Панель керування готова 👇", {
-    reply_markup: {
-      keyboard: [
-        [{ text: "🚀 ГОЛОВНЕ МЕНЮ" }]
-      ],
-      resize_keyboard: true, // робить кнопку компактною
-      persistent: true       // кнопка завжди висить внизу
-    }
-  });
-}
 
 function showMainMenu(chatId, messageId = null) {
   const text = "✂️ <b>ПАНЕЛЬ КЕРУВАННЯ OSTRI</b>\n\nОберіть потрібну дію нижче:";
@@ -85,12 +67,21 @@ function showMainMenu(chatId, messageId = null) {
     ]
   };
 
+  const keyboardOptions = {
+    parse_mode: 'HTML',
+    reply_markup: {
+      keyboard: [[{ text: "🚀 ГОЛОВНЕ МЕНЮ" }]],
+      resize_keyboard: true,
+      persistent: true
+    }
+  };
+
   if (messageId) {
-    bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup }).catch(() => {
-      bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
+    bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: reply_markup.reply_markup }).catch(() => {
+      bot.sendMessage(chatId, text, keyboardOptions);
     });
   } else {
-    bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
+    bot.sendMessage(chatId, text, keyboardOptions);
   }
 }
 
@@ -274,7 +265,6 @@ function renderTimeGrid(chatId, messageId) {
   ).catch(() => {});
 }
 
-// Реєстрація текстових повідомлень (на випадок кліку по клавіатурі)
 bot.on('message', (msg) => {
   if (msg.text === "🚀 ГОЛОВНЕ МЕНЮ") {
     showMainMenu(msg.chat.id);
