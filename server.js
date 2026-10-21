@@ -11,11 +11,11 @@ const MASTER_CHAT_ID = process.env.MASTER_CHAT_ID;
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Збереження розкладу: { "YYYY-MM-DD": ["10:00", "11:00", ...] }
+// Збереження розкладу: { "YYYY-MM-DD": ["10:00", "10:15", ...] }
 let schedule = {};
 
-// Тимчасова пам'ять для збереження вибору Колі під час кліків по кнопках
-let masterFlow = {};
+// Тимчасовий вибір Колі під час налаштування дня: { chatId: { date: '2026-10-21', times: ['10:00', '12:15'] } }
+let masterSetup = {};
 
 // API для сайту
 app.get('/api/schedule', (req, res) => {
@@ -58,33 +58,48 @@ bot.onText(/\/start/, (msg) => {
 });
 
 function showMainMenu(chatId) {
-  bot.sendMessage(chatId, "✂️ **Керування розкладом OSTRI**\n\nОберіть дію:", {
+  bot.sendMessage(chatId, "✂️ **Панель керування OSTRI**\n\nОберіть дію:", {
     parse_mode: 'Markdown',
     reply_markup: {
       inline_keyboard: [
         [{ text: "📅 Переглянути розклад", callback_data: "view_schedule" }],
-        [{ text: "➕ Додати робочий день / години", callback_data: "step_select_date" }],
+        [{ text: "➕ Налаштувати вільні години на день", callback_data: "step_7_days" }],
         [{ text: "🗑️ Очистити весь розклад", callback_data: "clear_schedule" }]
       ]
     }
   });
 }
 
-// Допоміжна функція для отримання дат (Сьогодні, Завтра, післязавтра)
-function getQuickDates() {
-  const dates = [];
-  for (let i = 0; i < 4; i++) {
+// Генерація 7 днів уперед
+function getNext7Days() {
+  const days = [];
+  for (let i = 0; i < 7; i++) {
     const d = new Date();
     d.setDate(d.getDate() + i);
-    const dateString = d.toISOString().split('T')[0];
+    const dateStr = d.toISOString().split('T')[0];
     
-    let label = dateString;
-    if (i === 0) label = `Сьогодні (${dateString})`;
-    else if (i === 1) label = `Завтра (${dateString})`;
-    
-    dates.push({ text: label, date: dateString });
+    let label = dateStr;
+    if (i === 0) label = `Сьогодні (${dateStr})`;
+    else if (i === 1) label = `Завтра (${dateStr})`;
+
+    days.push({ text: label, date: dateStr });
   }
-  return dates;
+  return days;
+}
+
+// Генерація слотів з кроком 15 хв від 09:00 до 20:00
+function generateTimeSlots() {
+  const slots = [];
+  for (let hour = 9; hour <= 20; hour++) {
+    for (let min = 0; min < 60; min += 15) {
+      // Зупиняємось о 20:00
+      if (hour === 20 && min > 0) break;
+      const hStr = hour.toString().padStart(2, '0');
+      const mStr = min.toString().padStart(2, '0');
+      slots.push(`${hStr}:${mStr}`);
+    }
+  }
+  return slots;
 }
 
 bot.on('callback_query', (query) => {
@@ -112,13 +127,13 @@ bot.on('callback_query', (query) => {
     return;
   }
 
-  // Крок 1: Вибір дати кнопками
-  if (data === "step_select_date") {
-    const quickDates = getQuickDates();
-    const keyboard = quickDates.map(item => [{ text: item.text, callback_data: `date_${item.date}` }]);
+  // Показуємо 7 днів на вибір
+  if (data === "step_7_days") {
+    const days = getNext7Days();
+    const keyboard = days.map(item => [{ text: item.text, callback_data: `pickday_${item.date}` }]);
     keyboard.push([{ text: "« Головне меню", callback_data: "main_menu" }]);
 
-    bot.editMessageText("📅 **Оберіть день для роботи:**", {
+    bot.editMessageText("📅 **Оберіть день (на 7 днів уперед):**", {
       chat_id: chatId,
       message_id: messageId,
       parse_mode: 'Markdown',
@@ -127,60 +142,55 @@ bot.on('callback_query', (query) => {
     return;
   }
 
-  // Повернення в головне меню
   if (data === "main_menu") {
     bot.deleteMessage(chatId, messageId).catch(() => {});
     showMainMenu(chatId);
     return;
   }
 
-  // Крок 2: Дата обрана, пропонуємо готові набори годин або повний день
-  if (data.startsWith("date_")) {
-    const selectedDate = data.replace("date_", "");
-    masterFlow[chatId] = { date: selectedDate };
-
-    bot.editMessageText(`📅 Обрана дата: **${selectedDate}**\n\nОберіть готові години або стандартний повний день:`, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "⚡ Повний день (09:00 - 19:00)", callback_data: "set_full_day" }],
-          [{ text: "🌅 Тільки перша половина (09:00 - 14:00)", callback_data: "set_morning" }],
-          [{ text: "🌇 Тільки друга половина (14:00 - 19:00)", callback_data: "set_evening" }],
-          [{ text: "« Назад до вибору дат", callback_data: "step_select_date" }]
-        ]
-      }
-    });
+  // Коли день обрано — відкриваємо сітку часу з кроком 15 хв
+  if (data.startsWith("pickday_")) {
+    const date = data.replace("pickday_", "");
+    // Ініціалізуємо поточний вибір для цього дня (якщо вже щось було — підтягуємо)
+    masterSetup[chatId] = {
+      date: date,
+      times: schedule[date] ? [...schedule[date]] : []
+    };
+    renderTimeGrid(chatId, messageId);
     return;
   }
 
-  // Швидке додавання повного дня (з інтервалом в 1 годину)
-  if (data === "set_full_day" || data === "set_morning" || data === "set_evening") {
-    const selectedDate = masterFlow[chatId] ? masterFlow[chatId].date : null;
-    if (!selectedDate) {
-      bot.sendMessage(chatId, "⚠️ Сталася помилка. Почніть спочатку з /start");
+  // Клік по конкретній годині (вмикає/вимикає її)
+  if (data.startsWith("time_")) {
+    const time = data.replace("time_", "");
+    if (!masterSetup[chatId]) return;
+
+    const timesArr = masterSetup[chatId].times;
+    if (timesArr.includes(time)) {
+      // Видаляємо, якщо вже була
+      masterSetup[chatId].times = timesArr.filter(t => t !== time);
+    } else {
+      // Додаємо
+      timesArr.push(time);
+      timesArr.sort();
+    }
+
+    renderTimeGrid(chatId, messageId);
+    return;
+  }
+
+  // Збереження обраних годин для цього дня
+  if (data === "save_day_schedule") {
+    const setup = masterSetup[chatId];
+    if (!setup || setup.times.length === 0) {
+      bot.answerCallbackQuery(query.id, { text: "⚠️ Оберіть хоча б одну годину!", show_alert: true });
       return;
     }
 
-    let times = [];
-    if (data === "set_full_day") {
-      times = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00"];
-    } else if (data === "set_morning") {
-      times = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00"];
-    } else if (data === "set_evening") {
-      times = ["14:00", "15:00", "16:00", "17:00", "18:00", "19:00"];
-    }
+    schedule[setup.date] = [...setup.times].sort();
+    delete masterSetup[chatId];
 
-    if (!schedule[selectedDate]) schedule[selectedDate] = [];
-    times.forEach(t => {
-      if (!schedule[selectedDate].includes(t)) schedule[selectedDate].push(t);
-    });
-    schedule[selectedDate].sort();
-
-    delete masterFlow[chatId];
-
-    bot.editMessageText(`✅ **Успішно додано!**\n\n📅 **${selectedDate}**\n⏰ Години: ${times.join(', ')}`, {
+    bot.editMessageText(`✅ **Розклад на ${setup.date} успішно збережено!**\n\n⏰ Доступні години: ${schedule[setup.date].join(', ')}`, {
       chat_id: chatId,
       message_id: messageId,
       parse_mode: 'Markdown'
@@ -190,6 +200,55 @@ bot.on('callback_query', (query) => {
     return;
   }
 });
+
+// Функція малювання сітки годин (по 4 в рядок для зручності)
+function renderTimeGrid(chatId, messageId) {
+  const setup = masterSetup[chatId];
+  if (!setup) return;
+
+  const allSlots = generateTimeSlots();
+  const selectedTimes = setup.times;
+
+  let keyboardRows = [];
+  let currentRow = [];
+
+  allSlots.forEach(slot => {
+    const isSelected = selectedTimes.includes(slot);
+    // Якщо година обрана — ставимо галочку, якщо ні — просто час
+    const text = isSelected ? `✅ ${slot}` : `⏳ ${slot}`;
+
+    currentRow.push({ text: text, callback_data: `time_${slot}` });
+
+    if (currentRow.length === 4) {
+      keyboardRows.push(currentRow);
+      currentRow = [];
+    }
+  });
+
+  if (currentRow.length > 0) {
+    keyboardRows.push(currentRow);
+  }
+
+  // Додаємо кнопки збереження та повернення
+  keyboardRows.push([
+    { text: "💾 ЗБЕРЕГТИ ЦЕЙ ДЕНЬ", callback_data: "save_day_schedule" }
+  ]);
+  keyboardRows.push([
+    { text: "« Змінити день", callback_data: "step_7_days" }
+  ]);
+
+  bot.editMessageText(
+    `📅 День: **${setup.date}**\n\n` +
+    `Натискайте на години, щоб **увімкнути/вимкнути** їх (крок 15 хв):\n` +
+    `Обрано: *${selectedTimes.length > 0 ? selectedTimes.join(', ') : 'жодної'}*`,
+    {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: keyboardRows }
+    }
+  );
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
