@@ -68,7 +68,6 @@ function showMainMenu(chatId, messageId = null) {
   };
 
   const keyboardOptions = {
-    parse_mode: 'HTML',
     reply_markup: {
       keyboard: [[{ text: "🚀 ГОЛОВНЕ МЕНЮ" }]],
       resize_keyboard: true,
@@ -77,11 +76,15 @@ function showMainMenu(chatId, messageId = null) {
   };
 
   if (messageId) {
-    bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: reply_markup.reply_markup }).catch(() => {
-      bot.sendMessage(chatId, text, keyboardOptions);
+    bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: reply_markup }).catch(() => {
+      bot.sendMessage(chatId, text, { parse_mode: 'HTML', ...reply_markup });
     });
   } else {
-    bot.sendMessage(chatId, text, keyboardOptions);
+    // Спочатку переконуємося, що нижня кнопка активна, потім шлемо чисте меню
+    bot.sendMessage(chatId, "Меню активовано 👇", keyboardOptions).then((sent) => {
+      bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+    });
+    bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
   }
 }
 
