@@ -57,6 +57,7 @@ bot.onText(/\/start|🚀 ГОЛОВНЕ МЕНЮ/, (msg) => {
   showMainMenu(chatId);
 });
 
+// Головна панель керування (завжди використовує постійну клавіатуру внизу)
 function showMainMenu(chatId, messageId = null) {
   const text = "✂️ <b>ПАНЕЛЬ КЕРУВАННЯ OSTRI</b>\n\nОберіть потрібну дію нижче:";
   const reply_markup = {
@@ -67,24 +68,24 @@ function showMainMenu(chatId, messageId = null) {
     ]
   };
 
-  const keyboardOptions = {
-    reply_markup: {
-      keyboard: [[{ text: "🚀 ГОЛОВНЕ МЕНЮ" }]],
-      resize_keyboard: true,
-      persistent: true
-    }
+  const persistentKeyboard = {
+    keyboard: [[{ text: "🚀 ГОЛОВНЕ МЕНЮ" }]],
+    resize_keyboard: true,
+    persistent: true
   };
 
   if (messageId) {
-    bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: reply_markup }).catch(() => {
-      bot.sendMessage(chatId, text, { parse_mode: 'HTML', ...reply_markup });
+    bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup }).catch(() => {
+      bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: { ...reply_markup, ...persistentKeyboard } });
     });
   } else {
-    // Спочатку переконуємося, що нижня кнопка активна, потім шлемо чисте меню
-    bot.sendMessage(chatId, "Меню активовано 👇", keyboardOptions).then((sent) => {
-      bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+    bot.sendMessage(chatId, text, {
+      parse_mode: 'HTML',
+      reply_markup: {
+        ...reply_markup,
+        ...persistentKeyboard
+      }
     });
-    bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
   }
 }
 
