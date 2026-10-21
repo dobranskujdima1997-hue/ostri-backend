@@ -429,6 +429,10 @@ async function renderDay(chatId, messageId) {
   });
   if (row.length > 0) rows.push(row);
 
+  rows.push([
+    { text: '✅ Обрати всі', callback_data: 'sel_all' },
+    { text: '🧹 Зняти всі', callback_data: 'sel_none' },
+  ]);
   rows.push([{ text: '💾 ЗБЕРЕГТИ ДЕНЬ', callback_data: 'save_day' }]);
   rows.push([
     { text: '🚫 Зробити вихідним', callback_data: 'day_off' },
@@ -436,16 +440,18 @@ async function renderDay(chatId, messageId) {
   ]);
   rows.push([{ text: '« Назад до днів', callback_data: 'step_days' }]);
 
-  let status;
-  if (ov) status = ov.closed ? '🚫 вихідний (змінено вручну)' : '✏️ змінено вручну';
-  else status = template.days[weekdayOf(setup.date)] ? 'за тижневим шаблоном' : '🚫 вихідний за шаблоном';
+  // що зараз відкрито на сайті (для довідки, сітка при цьому порожня)
+  const currentFree = futureOnly(setup.date, baseFor(setup.date, template, ov)).filter(
+    (t) => !booked.has(t)
+  );
 
   return editOrIgnore(
     `📅 <b>${prettyDate(setup.date)}</b> (${setup.date})\n` +
-      `Статус: ${status}\n\n` +
-      `Натискайте на години, щоб увімкнути/вимкнути їх.\n` +
+      `Зараз на сайті: <i>${rangesText(currentFree)}</i>\n\n` +
+      `Оберіть години, коли вам зручно працювати в цей день, і натисніть «💾 ЗБЕРЕГТИ ДЕНЬ». ` +
+      `Збережений вибір замінить поточні години.\n` +
       `🔒 - година вже зайнята клієнтом\n\n` +
-      `Відкрито: <i>${rangesText(selected)}</i>`,
+      `Обрано: <i>${selected.length ? rangesText(selected) : 'жодної'}</i>`,
     chatId,
     messageId,
     { inline_keyboard: rows }
@@ -592,7 +598,20 @@ bot.on('callback_query', async (query) => {
       const date = data.replace('pickday_', '');
       const w = await loadWindow();
       if (!w.dates.includes(date)) return renderDayPicker(chatId, messageId);
-      masterSetup[chatId] = { date, times: [...freeFor(date, w)] };
+      // сітка починається порожньою: мастер сам обирає зручні години
+      masterSetup[chatId] = { date, times: [] };
+      return renderDay(chatId, messageId);
+    }
+
+    if (data === 'sel_all' || data === 'sel_none') {
+      const setup = masterSetup[chatId];
+      if (!setup) return answer({ text: 'Оберіть день ще раз', show_alert: true });
+      answer();
+      if (data === 'sel_none') setup.times = [];
+      else {
+        const t = await getTemplate();
+        setup.times = futureOnly(setup.date, slotsBetween(t.start, t.end));
+      }
       return renderDay(chatId, messageId);
     }
 
@@ -679,9 +698,18 @@ bot.on('callback_query', async (query) => {
       answer();
       const date = setup.date;
       await overrides.deleteOne({ _id: date });
-      const w = await loadWindow();
-      masterSetup[chatId] = { date, times: [...freeFor(date, w)] };
-      return renderDay(chatId, messageId);
+      delete masterSetup[chatId];
+      return editOrIgnore(
+        `↩️ <b>${prettyDate(date)} повернено за тижневим шаблоном.</b>`,
+        chatId,
+        messageId,
+        {
+          inline_keyboard: [
+            [{ text: '✏️ Інші дні', callback_data: 'step_days' }],
+            [{ text: '« Головне меню', callback_data: 'main_menu' }],
+          ],
+        }
+      );
     }
 
     // --- тижневий шаблон ---
