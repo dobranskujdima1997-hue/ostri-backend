@@ -12,20 +12,41 @@ const MASTER_CHAT_ID = process.env.MASTER_CHAT_ID ? String(process.env.MASTER_CH
 const MONGODB_URI = process.env.MONGODB_URI;
 const TZ = 'Europe/Kyiv';
 const MENU_BUTTON = '🚀 ГОЛОВНЕ МЕНЮ';
+const DAYS_AHEAD = 30; // на скільки днів уперед відкритий запис
+const STEP_MIN = 15; // крок запису, хвилин
+
+// Шаблон за замовчуванням: пн-сб 08:00-20:00, неділя вихідний (days[0] = неділя)
+const DEFAULT_TEMPLATE = {
+  days: [false, true, true, true, true, true, true],
+  start: '08:00',
+  end: '20:00',
+};
+const WEEKDAYS = [
+  { idx: 1, label: 'Пн' },
+  { idx: 2, label: 'Вт' },
+  { idx: 3, label: 'Ср' },
+  { idx: 4, label: 'Чт' },
+  { idx: 5, label: 'Пт' },
+  { idx: 6, label: 'Сб' },
+  { idx: 0, label: 'Нд' },
+];
 
 if (!BOT_TOKEN || !MONGODB_URI) {
   console.error('Потрібні змінні середовища BOT_TOKEN та MONGODB_URI');
   process.exit(1);
 }
 
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
+
 // polling запускаємо лише після підключення до бази
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 bot.on('polling_error', (err) => console.error('polling_error:', err.code, err.message));
 
-let schedules; // { _id: 'YYYY-MM-DD', times: ['10:00', ...] }  - вільні години
+let settings; //  { _id:'template', days:[7 x bool], start, end }
+let overrides; // { _id:'YYYY-MM-DD', closed:bool, times:[...] }  - зміни окремих днів
 let bookings; //  { date, time, clientName, clientPhone, service, createdAt }
 
-// тимчасовий стан налаштування дня (не критичний, може жити в пам'яті)
+// тимчасовий стан редагування дня (не критичний, може жити в пам'яті)
 const masterSetup = {};
 
 // ---------- ДОПОМІЖНІ ----------
@@ -46,52 +67,127 @@ const prettyDate = (date) =>
     timeZone: 'UTC',
   });
 
-async function cleanOldDates() {
-  await schedules.deleteMany({ _id: { $lt: todayKyiv() } });
+const weekdayOf = (date) => new Date(date + 'T12:00:00Z').getUTCDay(); // 0 = неділя
+
+const toMin = (t) => {
+  const [h, m] = t.split(':').map(Number);
+  return h * 60 + m;
+};
+const fromMin = (m) =>
+  `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+
+// усі слоти від start до end (останній слот починається за STEP_MIN до закриття)
+function slotsBetween(start, end) {
+  const out = [];
+  for (let m = toMin(start); m + STEP_MIN <= toMin(end); m += STEP_MIN) out.push(fromMin(m));
+  return out;
 }
 
-async function getSchedule() {
-  await cleanOldDates();
-  const docs = await schedules.find({}).sort({ _id: 1 }).toArray();
-  const result = {};
-  docs.forEach((d) => {
-    if (d.times && d.times.length) result[d._id] = d.times;
+// ['08:00','08:15',...] -> "08:00–12:00, 13:00–20:00"
+function rangesText(times) {
+  if (!times.length) return '—';
+  const sorted = [...times].sort();
+  const out = [];
+  let start = sorted[0];
+  let prev = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    if (toMin(sorted[i]) - toMin(prev) === STEP_MIN) {
+      prev = sorted[i];
+      continue;
+    }
+    out.push(`${start}–${fromMin(toMin(prev) + STEP_MIN)}`);
+    start = prev = sorted[i];
+  }
+  out.push(`${start}–${fromMin(toMin(prev) + STEP_MIN)}`);
+  return out.join(', ');
+}
+
+function windowDates() {
+  const base = new Date(todayKyiv() + 'T12:00:00Z');
+  const dates = [];
+  for (let i = 0; i < DAYS_AHEAD; i++) {
+    const d = new Date(base);
+    d.setUTCDate(base.getUTCDate() + i);
+    dates.push(d.toISOString().split('T')[0]);
+  }
+  return dates;
+}
+
+// ---------- РОЗКЛАД: шаблон + винятки - записи ----------
+async function getTemplate() {
+  const doc = await settings.findOne({ _id: 'template' });
+  return {
+    days: doc?.days?.length === 7 ? doc.days : DEFAULT_TEMPLATE.days,
+    start: doc?.start || DEFAULT_TEMPLATE.start,
+    end: doc?.end || DEFAULT_TEMPLATE.end,
+  };
+}
+
+// усі години дня до віднімання записів: або з винятку, або з тижневого шаблону
+function baseFor(date, template, override) {
+  if (override) return override.closed ? [] : override.times || [];
+  if (!template.days[weekdayOf(date)]) return [];
+  return slotsBetween(template.start, template.end);
+}
+
+// для сьогодні відкидаємо години, що вже минули
+function futureOnly(date, times) {
+  if (date !== todayKyiv()) return times;
+  const now = nowTimeKyiv();
+  return times.filter((t) => t > now);
+}
+
+async function loadWindow() {
+  const dates = windowDates();
+  await overrides.deleteMany({ _id: { $lt: dates[0] } }).catch(() => {});
+
+  const [template, ovs, bks] = await Promise.all([
+    getTemplate(),
+    overrides.find({ _id: { $in: dates } }).toArray(),
+    bookings.find({ date: { $in: dates } }, { projection: { date: 1, time: 1 } }).toArray(),
+  ]);
+
+  const overrideMap = {};
+  ovs.forEach((o) => (overrideMap[o._id] = o));
+  const bookedMap = {};
+  bks.forEach((b) => {
+    if (!bookedMap[b.date]) bookedMap[b.date] = new Set();
+    bookedMap[b.date].add(b.time);
   });
-  return result;
+
+  return { dates, template, overrideMap, bookedMap };
 }
 
-// Майбутні записи: або після сьогоднішньої дати, або сьогодні, але ще не минулі
+// вільні години дня
+function freeFor(date, w) {
+  const booked = w.bookedMap[date] || new Set();
+  return futureOnly(date, baseFor(date, w.template, w.overrideMap[date])).filter(
+    (t) => !booked.has(t)
+  );
+}
+
+// ---------- ЗАПИСИ ----------
 function upcomingFilter() {
   return {
     $or: [{ date: { $gt: todayKyiv() } }, { date: todayKyiv(), time: { $gte: nowTimeKyiv() } }],
   };
 }
-
 const countUpcoming = () => bookings.countDocuments(upcomingFilter());
-
 const getUpcoming = (limit = 20) =>
   bookings.find(upcomingFilter()).sort({ date: 1, time: 1 }).limit(limit).toArray();
-
-async function addFreeTime(date, time) {
-  const doc = await schedules.findOne({ _id: date });
-  const times = [...new Set([...(doc?.times || []), time])].sort();
-  await schedules.updateOne({ _id: date }, { $set: { times } }, { upsert: true });
-}
 
 // ---------- API САЙТУ ----------
 app.get('/', (req, res) => res.send('OK')); // для пінгу, щоб Render не засинав
 
 app.get('/api/schedule', async (req, res) => {
   try {
-    const schedule = await getSchedule();
-    // для сьогодні не віддаємо години, що вже минули
-    const today = todayKyiv();
-    if (schedule[today]) {
-      const now = nowTimeKyiv();
-      schedule[today] = schedule[today].filter((t) => t > now);
-      if (schedule[today].length === 0) delete schedule[today];
-    }
-    res.json(schedule);
+    const w = await loadWindow();
+    const out = {};
+    w.dates.forEach((d) => {
+      const free = freeFor(d, w);
+      if (free.length) out[d] = free;
+    });
+    res.json(out);
   } catch (e) {
     console.error('GET /api/schedule:', e.message);
     res.status(500).json({});
@@ -113,13 +209,13 @@ app.post('/api/book', async (req, res) => {
   }
 
   try {
-    // Атомарно забираємо годину: двоє людей не зможуть записатись на один слот
-    const r = await schedules.updateOne({ _id: date, times: time }, { $pull: { times: time } });
-    if (r.modifiedCount !== 1) {
+    const w = await loadWindow();
+    if (!w.dates.includes(date) || !freeFor(date, w).includes(time)) {
       return res.status(400).json({ success: false, message: 'Цей час уже зайнятий.' });
     }
 
     try {
+      // унікальний індекс (date + time) гарантує, що двоє не запишуться на одну годину
       await bookings.insertOne({
         date,
         time,
@@ -129,11 +225,11 @@ app.post('/api/book', async (req, res) => {
         createdAt: new Date(),
       });
     } catch (e) {
-      await addFreeTime(date, time); // відкат, якщо запис не вдався
+      if (e.code === 11000) {
+        return res.status(400).json({ success: false, message: 'Цей час уже зайнятий.' });
+      }
       throw e;
     }
-
-    await schedules.deleteOne({ _id: date, times: { $size: 0 } });
 
     if (MASTER_CHAT_ID) {
       bot
@@ -170,9 +266,9 @@ async function panelMarkup() {
   return {
     inline_keyboard: [
       [{ text: `📋 Записи клієнтів (${count})`, callback_data: 'view_bookings' }],
-      [{ text: '📅 Переглянути поточний розклад', callback_data: 'view_schedule' }],
-      [{ text: '➕ Налаштувати години на день', callback_data: 'step_7_days' }],
-      [{ text: '🗑️ Очистити вільні години', callback_data: 'clear_schedule' }],
+      [{ text: `📅 Розклад на ${DAYS_AHEAD} днів`, callback_data: 'view_schedule' }],
+      [{ text: '✏️ Змінити день / зробити вихідним', callback_data: 'step_days' }],
+      [{ text: '⚙️ Тижневий шаблон', callback_data: 'tpl_menu' }],
     ],
   };
 }
@@ -214,36 +310,6 @@ bot.on('message', async (msg) => {
   }
 });
 
-function getNext7Days() {
-  const base = new Date(todayKyiv() + 'T12:00:00Z');
-  const days = [];
-  for (let i = 0; i < 7; i++) {
-    const d = new Date(base);
-    d.setUTCDate(base.getUTCDate() + i);
-    const dateStr = d.toISOString().split('T')[0];
-    let label = dateStr;
-    if (i === 0) label = `Сьогодні (${dateStr})`;
-    else if (i === 1) label = `Завтра (${dateStr})`;
-    days.push({ text: label, date: dateStr });
-  }
-  return days;
-}
-
-function generateTimeSlots(date) {
-  const slots = [];
-  const isToday = date === todayKyiv();
-  const now = nowTimeKyiv();
-  for (let hour = 9; hour <= 20; hour++) {
-    for (let min = 0; min < 60; min += 15) {
-      if (hour === 20 && min > 0) break;
-      const slot = `${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
-      if (isToday && slot <= now) continue;
-      slots.push(slot);
-    }
-  }
-  return slots;
-}
-
 const backToMenu = { inline_keyboard: [[{ text: '« Головне меню', callback_data: 'main_menu' }]] };
 
 const editOrIgnore = (text, chatId, messageId, reply_markup) =>
@@ -282,21 +348,74 @@ async function showBookings(chatId, messageId) {
   return editOrIgnore(text, chatId, messageId, { inline_keyboard: keyboard });
 }
 
-async function renderTimeGrid(chatId, messageId) {
+// ----- перегляд розкладу на 30 днів -----
+async function showSchedule(chatId, messageId) {
+  const w = await loadWindow();
+  let msg = `📅 <b>Розклад на ${DAYS_AHEAD} днів</b>\n\n`;
+
+  w.dates.forEach((d) => {
+    const free = freeFor(d, w);
+    const bk = (w.bookedMap[d] || new Set()).size;
+    const ov = w.overrideMap[d];
+    const off = ov ? !!ov.closed : !w.template.days[weekdayOf(d)];
+    const bkText = bk ? ` · записів: ${bk}` : '';
+
+    if (off && free.length === 0) msg += `🚫 ${prettyDate(d)} — вихідний${bkText}\n`;
+    else if (free.length === 0) msg += `🔴 ${prettyDate(d)} — вільних годин немає${bkText}\n`;
+    else msg += `🟢 ${prettyDate(d)} — ${rangesText(free)}${bkText}${ov ? ' ✏️' : ''}\n`;
+  });
+
+  msg += '\n🟢 є вільні години · 🔴 усе зайнято · 🚫 вихідний · ✏️ змінено вручну';
+  return editOrIgnore(msg, chatId, messageId, backToMenu);
+}
+
+// ----- вибір дня для редагування -----
+async function renderDayPicker(chatId, messageId) {
+  const w = await loadWindow();
+  const buttons = w.dates.map((d) => {
+    const ov = w.overrideMap[d];
+    const off = ov ? !!ov.closed : !w.template.days[weekdayOf(d)];
+    const mark = off ? '🚫 ' : ov ? '✏️ ' : '';
+    return { text: `${mark}${prettyDate(d)}`, callback_data: `pickday_${d}` };
+  });
+
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 3) rows.push(buttons.slice(i, i + 3));
+  rows.push([{ text: '« Головне меню', callback_data: 'main_menu' }]);
+
+  return editOrIgnore(
+    '✏️ <b>Оберіть день</b>\n\n🚫 вихідний · ✏️ змінено вручну\n\n' +
+      'Тут можна змінити години окремого дня або зробити його вихідним. Загальний графік - у «⚙️ Тижневий шаблон».',
+    chatId,
+    messageId,
+    { inline_keyboard: rows }
+  );
+}
+
+// ----- редагування одного дня -----
+async function renderDay(chatId, messageId) {
   const setup = masterSetup[chatId];
   if (!setup) return;
 
-  // години, на які вже є запис клієнта - блокуємо
-  const booked = new Set(
-    (await bookings.find({ date: setup.date }).toArray()).map((b) => b.time)
-  );
-  setup.times = setup.times.filter((t) => !booked.has(t));
+  const [template, ov, bks] = await Promise.all([
+    getTemplate(),
+    overrides.findOne({ _id: setup.date }),
+    bookings.find({ date: setup.date }).toArray(),
+  ]);
 
+  // години з записом клієнта блокуємо
+  const booked = new Set(bks.map((b) => b.time));
+  setup.times = setup.times.filter((t) => !booked.has(t));
   const selected = setup.times;
+
+  const slots = futureOnly(
+    setup.date,
+    [...new Set([...slotsBetween(template.start, template.end), ...selected, ...booked])].sort()
+  );
+
   const rows = [];
   let row = [];
-
-  generateTimeSlots(setup.date).forEach((slot) => {
+  slots.forEach((slot) => {
     let btn;
     if (booked.has(slot)) btn = { text: `🔒 ${slot}`, callback_data: 'noop' };
     else if (selected.includes(slot)) btn = { text: `✅ ${slot}`, callback_data: `time_${slot}` };
@@ -310,20 +429,84 @@ async function renderTimeGrid(chatId, messageId) {
   });
   if (row.length > 0) rows.push(row);
 
-  rows.push([{ text: '💾 ЗБЕРЕГТИ ДЕНЬ', callback_data: 'save_day_schedule' }]);
-  rows.push([{ text: '« Назад до днів', callback_data: 'step_7_days' }]);
+  rows.push([{ text: '💾 ЗБЕРЕГТИ ДЕНЬ', callback_data: 'save_day' }]);
+  rows.push([
+    { text: '🚫 Зробити вихідним', callback_data: 'day_off' },
+    { text: '↩️ За шаблоном', callback_data: 'day_reset' },
+  ]);
+  rows.push([{ text: '« Назад до днів', callback_data: 'step_days' }]);
+
+  let status;
+  if (ov) status = ov.closed ? '🚫 вихідний (змінено вручну)' : '✏️ змінено вручну';
+  else status = template.days[weekdayOf(setup.date)] ? 'за тижневим шаблоном' : '🚫 вихідний за шаблоном';
 
   return editOrIgnore(
-    `📅 День: <b>${setup.date}</b>\n\n` +
-      `Натискайте на години, щоб увімкнути/вимкнути їх:\n` +
-      `🔒 - година вже зайнята клієнтом\n` +
-      `Обрано: <i>${selected.length > 0 ? selected.join(', ') : 'жодної'}</i>`,
+    `📅 <b>${prettyDate(setup.date)}</b> (${setup.date})\n` +
+      `Статус: ${status}\n\n` +
+      `Натискайте на години, щоб увімкнути/вимкнути їх.\n` +
+      `🔒 - година вже зайнята клієнтом\n\n` +
+      `Відкрито: <i>${rangesText(selected)}</i>`,
     chatId,
     messageId,
     { inline_keyboard: rows }
   );
 }
 
+// ----- тижневий шаблон -----
+async function renderTemplate(chatId, messageId) {
+  const t = await getTemplate();
+  const working = WEEKDAYS.filter((d) => t.days[d.idx]).map((d) => d.label);
+  const off = WEEKDAYS.filter((d) => !t.days[d.idx]).map((d) => d.label);
+
+  const dayButtons = WEEKDAYS.map((d) => ({
+    text: `${t.days[d.idx] ? '✅' : '🚫'} ${d.label}`,
+    callback_data: `tpl_day_${d.idx}`,
+  }));
+
+  return editOrIgnore(
+    `⚙️ <b>Тижневий шаблон</b>\n\n` +
+      `🕗 Робочі години: <b>${t.start}–${t.end}</b> (крок ${STEP_MIN} хв)\n` +
+      `✅ Робочі дні: ${working.join(', ') || '—'}\n` +
+      `🚫 Вихідні: ${off.join(', ') || '—'}\n\n` +
+      `Натисніть на день тижня, щоб перемкнути робочий/вихідний. ` +
+      `Зміни діють на всі дні, які ви не змінювали вручну. Записи клієнтів не зачіпаються.`,
+    chatId,
+    messageId,
+    {
+      inline_keyboard: [
+        dayButtons.slice(0, 4),
+        dayButtons.slice(4),
+        [
+          { text: `🕗 Початок: ${t.start}`, callback_data: 'tpl_start' },
+          { text: `🕗 Кінець: ${t.end}`, callback_data: 'tpl_end' },
+        ],
+        [{ text: '« Головне меню', callback_data: 'main_menu' }],
+      ],
+    }
+  );
+}
+
+function renderHourPicker(chatId, messageId, kind) {
+  const from = kind === 'start' ? 6 : 14;
+  const to = kind === 'start' ? 12 : 23;
+  const buttons = [];
+  for (let h = from; h <= to; h++) {
+    const hh = String(h).padStart(2, '0');
+    buttons.push({ text: `${hh}:00`, callback_data: `tpl_set${kind}_${hh}` });
+  }
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 4) rows.push(buttons.slice(i, i + 4));
+  rows.push([{ text: '« Назад', callback_data: 'tpl_menu' }]);
+
+  return editOrIgnore(
+    kind === 'start' ? '🕗 <b>Оберіть час початку роботи:</b>' : '🕗 <b>Оберіть час закінчення роботи:</b>',
+    chatId,
+    messageId,
+    { inline_keyboard: rows }
+  );
+}
+
+// ----- обробка кнопок -----
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -333,13 +516,14 @@ bot.on('callback_query', async (query) => {
   try {
     if (!isMaster(chatId)) return answer({ text: '⛔ Немає доступу', show_alert: true });
 
-    if (data === 'noop') return answer({ text: '🔒 На цю годину вже є запис', show_alert: false });
+    if (data === 'noop') return answer({ text: '🔒 На цю годину вже є запис' });
 
     if (data === 'main_menu') {
       answer();
       return showMainMenu(chatId, messageId);
     }
 
+    // --- записи ---
     if (data === 'view_bookings') {
       answer();
       return showBookings(chatId, messageId);
@@ -374,8 +558,8 @@ bot.on('callback_query', async (query) => {
       answer();
       const id = data.replace('cancel_', '');
       if (!ObjectId.isValid(id)) return;
+      // година стає вільною автоматично: розклад = шаблон/виняток мінус записи
       const b = await bookings.findOneAndDelete({ _id: new ObjectId(id) });
-      if (b) await addFreeTime(b.date, b.time);
       return editOrIgnore(
         b
           ? `✅ <b>Запис скасовано.</b>\n\n${escapeHtml(b.clientName)} · ${prettyDate(b.date)} ${b.time}\nГодина знову вільна.`
@@ -391,44 +575,25 @@ bot.on('callback_query', async (query) => {
       );
     }
 
+    // --- розклад ---
     if (data === 'view_schedule') {
       answer();
-      const schedule = await getSchedule();
-      let msg = '📅 <b>Поточний розклад (вільні години):</b>\n\n';
-      const dates = Object.keys(schedule).sort();
-      if (dates.length === 0) msg += '❌ Немає відкритих дат.';
-      else dates.forEach((d) => (msg += `📌 <b>${d}</b>: ${schedule[d].join(', ')}\n`));
-      return editOrIgnore(msg, chatId, messageId, backToMenu);
+      return showSchedule(chatId, messageId);
     }
 
-    if (data === 'clear_schedule') {
+    if (data === 'step_days') {
       answer();
-      await schedules.deleteMany({});
-      return editOrIgnore(
-        '🗑️ <b>Усі вільні години очищено!</b>\n\nЗаписи клієнтів збережені.',
-        chatId,
-        messageId,
-        backToMenu
-      );
-    }
-
-    if (data === 'step_7_days') {
-      answer();
-      const keyboard = getNext7Days().map((item) => [
-        { text: item.text, callback_data: `pickday_${item.date}` },
-      ]);
-      keyboard.push([{ text: '« Головне меню', callback_data: 'main_menu' }]);
-      return editOrIgnore('📅 <b>Оберіть день для налаштування:</b>', chatId, messageId, {
-        inline_keyboard: keyboard,
-      });
+      delete masterSetup[chatId];
+      return renderDayPicker(chatId, messageId);
     }
 
     if (data.startsWith('pickday_')) {
       answer();
       const date = data.replace('pickday_', '');
-      const doc = await schedules.findOne({ _id: date });
-      masterSetup[chatId] = { date, times: doc?.times ? [...doc.times] : [] };
-      return renderTimeGrid(chatId, messageId);
+      const w = await loadWindow();
+      if (!w.dates.includes(date)) return renderDayPicker(chatId, messageId);
+      masterSetup[chatId] = { date, times: [...freeFor(date, w)] };
+      return renderDay(chatId, messageId);
     }
 
     if (data.startsWith('time_')) {
@@ -441,34 +606,131 @@ bot.on('callback_query', async (query) => {
         setup.times.push(time);
         setup.times.sort();
       }
-      return renderTimeGrid(chatId, messageId);
+      return renderDay(chatId, messageId);
     }
 
-    if (data === 'save_day_schedule') {
+    if (data === 'save_day') {
       const setup = masterSetup[chatId];
-      if (!setup || setup.times.length === 0) {
-        return answer({ text: '⚠️ Оберіть хоча б одну годину!', show_alert: true });
+      if (!setup) return answer({ text: 'Оберіть день ще раз', show_alert: true });
+      if (setup.times.length === 0) {
+        return answer({
+          text: '⚠️ Оберіть хоча б одну годину або натисніть «Зробити вихідним».',
+          show_alert: true,
+        });
       }
       answer();
 
-      // ще раз відсікаємо години, які встигли забронювати
-      const booked = new Set(
-        (await bookings.find({ date: setup.date }).toArray()).map((b) => b.time)
-      );
-      const times = setup.times.filter((t) => !booked.has(t)).sort();
-      if (times.length === 0) {
-        return answer({ text: '⚠️ Усі обрані години вже зайняті.', show_alert: true });
-      }
+      // години з записами зберігаємо в списку, щоб після скасування запису година повернулась
+      const bks = await bookings.find({ date: setup.date }).toArray();
+      const bookedTimes = bks.map((b) => b.time);
+      const times = [...new Set([...setup.times, ...bookedTimes])].sort();
 
-      await schedules.updateOne({ _id: setup.date }, { $set: { times } }, { upsert: true });
+      await overrides.updateOne(
+        { _id: setup.date },
+        { $set: { closed: false, times } },
+        { upsert: true }
+      );
+      const selected = [...setup.times].sort();
+      const date = setup.date;
       delete masterSetup[chatId];
 
       return editOrIgnore(
-        `✅ <b>Розклад на ${setup.date} успішно збережено!</b>\n\n⏰ Доступні години: ${times.join(', ')}`,
+        `✅ <b>${prettyDate(date)} збережено!</b>\n\n⏰ Відкрито: ${rangesText(selected)}`,
         chatId,
         messageId,
-        backToMenu
+        {
+          inline_keyboard: [
+            [{ text: '✏️ Інші дні', callback_data: 'step_days' }],
+            [{ text: '« Головне меню', callback_data: 'main_menu' }],
+          ],
+        }
       );
+    }
+
+    if (data === 'day_off') {
+      const setup = masterSetup[chatId];
+      if (!setup) return answer({ text: 'Оберіть день ще раз', show_alert: true });
+      answer();
+      const date = setup.date;
+      await overrides.updateOne(
+        { _id: date },
+        { $set: { closed: true }, $unset: { times: '' } },
+        { upsert: true }
+      );
+      const bk = await bookings.countDocuments({ date });
+      delete masterSetup[chatId];
+      return editOrIgnore(
+        `🚫 <b>${prettyDate(date)} — вихідний.</b>\n\nЗапис на сайті на цей день закрито.` +
+          (bk ? `\n\n⚠️ На цей день уже є записів: <b>${bk}</b>. Вони залишились - перегляньте їх у «📋 Записи клієнтів».` : ''),
+        chatId,
+        messageId,
+        {
+          inline_keyboard: [
+            [{ text: '✏️ Інші дні', callback_data: 'step_days' }],
+            [{ text: '« Головне меню', callback_data: 'main_menu' }],
+          ],
+        }
+      );
+    }
+
+    if (data === 'day_reset') {
+      const setup = masterSetup[chatId];
+      if (!setup) return answer({ text: 'Оберіть день ще раз', show_alert: true });
+      answer();
+      const date = setup.date;
+      await overrides.deleteOne({ _id: date });
+      const w = await loadWindow();
+      masterSetup[chatId] = { date, times: [...freeFor(date, w)] };
+      return renderDay(chatId, messageId);
+    }
+
+    // --- тижневий шаблон ---
+    if (data === 'tpl_menu') {
+      answer();
+      return renderTemplate(chatId, messageId);
+    }
+
+    if (data.startsWith('tpl_day_')) {
+      answer();
+      const i = Number(data.replace('tpl_day_', ''));
+      if (!(i >= 0 && i <= 6)) return;
+      const t = await getTemplate();
+      const days = [...t.days];
+      days[i] = !days[i];
+      await settings.updateOne({ _id: 'template' }, { $set: { days } }, { upsert: true });
+      return renderTemplate(chatId, messageId);
+    }
+
+    if (data === 'tpl_start') {
+      answer();
+      return renderHourPicker(chatId, messageId, 'start');
+    }
+
+    if (data === 'tpl_end') {
+      answer();
+      return renderHourPicker(chatId, messageId, 'end');
+    }
+
+    if (data.startsWith('tpl_setstart_')) {
+      const start = `${data.replace('tpl_setstart_', '')}:00`;
+      const t = await getTemplate();
+      if (toMin(start) >= toMin(t.end)) {
+        return answer({ text: '⚠️ Початок має бути раніше за кінець роботи', show_alert: true });
+      }
+      answer();
+      await settings.updateOne({ _id: 'template' }, { $set: { start } }, { upsert: true });
+      return renderTemplate(chatId, messageId);
+    }
+
+    if (data.startsWith('tpl_setend_')) {
+      const end = `${data.replace('tpl_setend_', '')}:00`;
+      const t = await getTemplate();
+      if (toMin(end) <= toMin(t.start)) {
+        return answer({ text: '⚠️ Кінець має бути пізніше за початок роботи', show_alert: true });
+      }
+      answer();
+      await settings.updateOne({ _id: 'template' }, { $set: { end } }, { upsert: true });
+      return renderTemplate(chatId, messageId);
     }
 
     answer();
@@ -483,7 +745,8 @@ async function main() {
   const client = new MongoClient(MONGODB_URI);
   await client.connect();
   const db = client.db(process.env.DB_NAME || 'ostri');
-  schedules = db.collection('schedule');
+  settings = db.collection('settings');
+  overrides = db.collection('overrides');
   bookings = db.collection('bookings');
 
   // один запис на одну дату+годину
